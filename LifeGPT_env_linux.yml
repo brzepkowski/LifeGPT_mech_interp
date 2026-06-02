@@ -6,9 +6,9 @@ channels:
   - defaults
 dependencies:
   - python=3.10
-  - pytorch
-  - torchvision
-  - torchaudio
+  - pytorch=2.3.0
+  - torchvision=0.18.0
+  - torchaudio=2.3.0
   - pytorch-cuda=12.1
   - numpy
   - pandas
@@ -22,7 +22,7 @@ dependencies:
   - scipy
   - pip
   - pip:
-    - x-transformers
+    - x-transformers==1.27.21
     - scikit-optimize
     - moviepy
     - imageio
@@ -30,4 +30,3 @@ dependencies:
     - einops
     - accelerate
     - huggingface-hub
-    - torch-geometric
