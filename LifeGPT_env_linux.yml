@@ -1,0 +1,33 @@
+name: LifeGPT_env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - numpy
+  - pandas
+  - matplotlib
+  - seaborn
+  - pillow
+  - tqdm
+  - ipython
+  - jupyter
+  - scikit-learn
+  - scipy
+  - pip
+  - pip:
+    - x-transformers
+    - scikit-optimize
+    - moviepy
+    - imageio
+    - opencv-python
+    - einops
+    - accelerate
+    - huggingface-hub
+    - torch-geometric
