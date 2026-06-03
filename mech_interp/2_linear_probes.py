@@ -12,6 +12,7 @@ For each of N_SAMPLES examples from the dataset:
   4. Report and plot probe accuracy across layers.
 """
 
+import gc
 import os
 import numpy as np
 import pandas as pd
@@ -33,11 +34,16 @@ print(device)
 NUM_WORDS  = 256
 MAX_LENGTH = len("@PredictNextState<> []$") + (32 * 32 * 2)   # 2071
 GRID_SIZE  = 32
-N_SAMPLES      = 50
+N_SAMPLES      = 500
 TRAIN_RATIO    = 0.8   # 80 % train, 20 % test
 N_TRAIN        = int(N_SAMPLES * TRAIN_RATIO)
 TOTAL_ROWS     = 10000
 ROW_SKIP_START = 0    # skip the near-empty all-zero rows at the very start
+
+N_CLASSES  = 9
+N_EPOCHS   = 2000
+PROBE_LR   = 0.1
+EVAL_EVERY = 100
 
 SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 PLOTS_DIR       = os.path.join(SCRIPT_DIR, "plots")
@@ -197,12 +203,29 @@ for i, row in df.iterrows():
     if (i + 1) % 2 == 0 or (i + 1) == N_SAMPLES:
         print(f"  {i + 1}/{N_SAMPLES}  acts shape: {tuple(acts.shape)}")
 
+# Example B grid (needed before we free the model)
+simple_grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.int32)
+for _r, _c in [(0,1),(1,2),(2,0),(2,1),(2,2)]:
+    simple_grid[_r + 2, _c + 2] = 1
+for _r, _c in [(0,0),(0,1),(0,2)]:
+    simple_grid[_r + 15, _c + 14] = 1
+for _r, _c in [(0,0),(0,1),(1,0),(1,1)]:
+    simple_grid[_r + 25, _c + 25] = 1
+simple_next       = gol_step(simple_grid)
+simple_acts, _    = extract_activations(simple_grid, simple_next)
+simple_actual_grid = neighbor_sum(simple_grid).reshape(GRID_SIZE, GRID_SIZE)
+
 # Stack → (N_SAMPLES, n_checkpoints, 1024, d_model)
 all_acts_np      = torch.stack(all_acts, dim=0).numpy()
 all_neighbors_np = np.stack(all_neighbors, axis=0)          # (N_SAMPLES, 1024)
 
 n_checkpoints = all_acts_np.shape[1]
 d_model       = all_acts_np.shape[3]
+
+# Free the model from VRAM — activations are fully extracted
+del model
+gc.collect()
+torch.cuda.empty_cache()
 
 print(f"\nall_acts shape      : {all_acts_np.shape}")
 print(f"all_neighbors shape : {all_neighbors_np.shape}")
@@ -212,23 +235,16 @@ print(f"Neighbor sum range  : {all_neighbors_np.min()} – {all_neighbors_np.max
 # Splitting at the grid level prevents positions from the same grid leaking
 # into both train and test sets (positions in the same grid are spatially correlated).
 
-N_TEST = N_SAMPLES - N_TRAIN
+N_TEST  = N_SAMPLES - N_TRAIN
+y_train = all_neighbors_np[:N_TRAIN].reshape(-1)   # for chance-accuracy print only
 
-X_train = all_acts_np[:N_TRAIN]          # (N_TRAIN, n_checkpoints, 1024, d_model)
-X_test  = all_acts_np[N_TRAIN:]          # (N_TEST,  n_checkpoints, 1024, d_model)
-y_train = all_neighbors_np[:N_TRAIN].reshape(-1)   # (N_TRAIN * 1024,)
-y_test  = all_neighbors_np[N_TRAIN:].reshape(-1)   # (N_TEST  * 1024,)
-
-print(f"\nTrain : {N_TRAIN} grids  →  {len(y_train)} positions")
-print(f"Test  : {N_TEST}  grids  →  {len(y_test)} positions")
+print(f"\nTrain : {N_TRAIN} grids  →  {N_TRAIN * GRID_SIZE * GRID_SIZE} positions")
+print(f"Test  : {N_TEST}  grids  →  {N_TEST  * GRID_SIZE * GRID_SIZE} positions")
 print(f"Chance accuracy (majority class): "
       f"{np.bincount(y_train).max() / len(y_train):.3f}")
 
-# ── Train all probes in parallel on GPU (batched logistic regression) ─────────
+# ── Train all probes in parallel on GPU ───────────────────────────────────────
 
-n_classes   = 9      # neighbor sums 0-8
-N_EPOCHS    = 2000
-PROBE_LR    = 0.1
 n_train_pos = N_TRAIN * GRID_SIZE * GRID_SIZE
 n_test_pos  = N_TEST  * GRID_SIZE * GRID_SIZE
 
@@ -244,8 +260,8 @@ Xk_te = X_all_t[:, n_train_pos:, :]
 y_tr  = y_flat[:n_train_pos]
 y_te  = y_flat[n_train_pos:]
 
-# Per-checkpoint z-score normalisation (equivalent to StandardScaler)
-mean_tr = Xk_tr.mean(dim=1, keepdim=True)               # (K, 1, D)
+# Per-checkpoint z-score normalisation
+mean_tr = Xk_tr.mean(dim=1, keepdim=True)
 std_tr  = Xk_tr.std(dim=1, keepdim=True).clamp(min=1e-8)
 Xk_tr   = (Xk_tr - mean_tr) / std_tr
 Xk_te   = (Xk_te - mean_tr) / std_tr
@@ -253,51 +269,48 @@ Xk_te   = (Xk_te - mean_tr) / std_tr
 Xk_tr_d  = Xk_tr.to(device)
 Xk_te_d  = Xk_te.to(device)
 y_tr_d   = y_tr.to(device)
-y_labels = y_tr_d.repeat(n_checkpoints)   # (K * n_train_pos,) — same labels for each probe
+y_te_d   = y_te.to(device)
+y_labels = y_tr_d.repeat(n_checkpoints)   # (K * n_train_pos,)
 
 # One weight matrix per checkpoint, trained simultaneously via bmm
 W = torch.nn.init.xavier_uniform_(
-    torch.empty(n_checkpoints, d_model, n_classes, device=device)
+    torch.empty(n_checkpoints, d_model, N_CLASSES, device=device)
 ).requires_grad_(True)
-b = torch.zeros(n_checkpoints, n_classes, device=device, requires_grad=True)
+b = torch.zeros(n_checkpoints, N_CLASSES, device=device, requires_grad=True)
 
 optimizer = torch.optim.Adam([W, b], lr=PROBE_LR,
                              weight_decay=1.0 / n_train_pos)
 loss_fn = torch.nn.CrossEntropyLoss()
 
-# Per-probe best-weight tracking: each probe independently snapshots its
-# weights whenever it beats its own previous best test accuracy.
-EVAL_EVERY = 100
+# Per-probe best-weight tracking
 best_W   = W.detach().clone()
 best_b   = b.detach().clone()
 best_acc = torch.zeros(n_checkpoints, device=device)
-y_te_d   = y_te.to(device)
 
 print(f"\nTraining {n_checkpoints} probes in parallel on {device} ...")
 for epoch in range(N_EPOCHS):
-    logits = torch.bmm(Xk_tr_d, W) + b.unsqueeze(1)   # (K, n_train_pos, C)
-    loss   = loss_fn(logits.reshape(-1, n_classes), y_labels)
+    logits = torch.bmm(Xk_tr_d, W) + b.unsqueeze(1)
+    loss   = loss_fn(logits.reshape(-1, N_CLASSES), y_labels)
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
     if (epoch + 1) % EVAL_EVERY == 0:
         with torch.no_grad():
-            te_logits = torch.bmm(Xk_te_d, W) + b.unsqueeze(1)        # (K, n_test_pos, C)
-            accs      = (te_logits.argmax(-1) == y_te_d).float().mean(dim=1)  # (K,)
+            te_logits = torch.bmm(Xk_te_d, W) + b.unsqueeze(1)
+            accs      = (te_logits.argmax(-1) == y_te_d).float().mean(dim=1)
             improved  = accs > best_acc
             best_W[improved] = W.detach()[improved]
             best_b[improved] = b.detach()[improved]
             best_acc = torch.where(improved, accs, best_acc)
-        if (epoch + 1) % 500 == 0:
-            print(f"  epoch {epoch+1}/{N_EPOCHS}  loss={loss.item():.4f}  "
-                  f"best_acc min={best_acc.min():.3f} max={best_acc.max():.3f}")
+        print(f"  epoch {epoch+1}/{N_EPOCHS}  loss={loss.item():.4f}  "
+              f"best_acc min={best_acc.min():.3f} max={best_acc.max():.3f}")
 
 print("  done")
 
 with torch.no_grad():
-    tr_preds = (torch.bmm(Xk_tr_d, best_W) + best_b.unsqueeze(1)).argmax(-1).cpu()  # (K, n_train_pos)
-    te_preds = (torch.bmm(Xk_te_d, best_W) + best_b.unsqueeze(1)).argmax(-1).cpu()  # (K, n_test_pos)
+    tr_preds = (torch.bmm(Xk_tr_d, best_W) + best_b.unsqueeze(1)).argmax(-1).cpu()
+    te_preds = (torch.bmm(Xk_te_d, best_W) + best_b.unsqueeze(1)).argmax(-1).cpu()
 
 y_tr_np = y_tr.numpy()
 y_te_np = y_te.numpy()
@@ -411,17 +424,8 @@ test_actual = all_neighbors_np[N_TRAIN].reshape(GRID_SIZE, GRID_SIZE)
 test_err    = (test_pred != test_actual).astype(int)
 
 # Example B: sparse, human-readable pattern (glider + blinker + 2×2 block)
-simple_grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.int32)
-for r, c in [(0,1),(1,2),(2,0),(2,1),(2,2)]:       # glider (top-left)
-    simple_grid[r + 2, c + 2] = 1
-for r, c in [(0,0),(0,1),(0,2)]:                    # blinker, horizontal (centre)
-    simple_grid[r + 15, c + 14] = 1
-for r, c in [(0,0),(0,1),(1,0),(1,1)]:              # 2×2 block / still-life (bottom-right)
-    simple_grid[r + 25, c + 25] = 1
-
-simple_next   = gol_step(simple_grid)
-simple_acts, _= extract_activations(simple_grid, simple_next)
-simple_actual = neighbor_sum(simple_grid).reshape(GRID_SIZE, GRID_SIZE)
+# (simple_grid, simple_acts, simple_actual_grid extracted before model was freed)
+simple_actual = simple_actual_grid
 simple_pred   = probe_predict(
                     best_r, simple_acts[best["checkpoint"]].numpy()
                 ).reshape(GRID_SIZE, GRID_SIZE)
@@ -476,5 +480,5 @@ torch.save({
     "N_TRAIN":         N_TRAIN,
     "N_TEST":          N_TEST,
     "grid_size":       GRID_SIZE,
-}, save_path)
+}, save_path, pickle_protocol=4)
 print(f"Saved probe results to {save_path}")
