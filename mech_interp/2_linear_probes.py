@@ -20,8 +20,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import typing
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
 
 from x_transformers import TransformerWrapper, Decoder
@@ -35,7 +33,7 @@ print(device)
 NUM_WORDS  = 256
 MAX_LENGTH = len("@PredictNextState<> []$") + (32 * 32 * 2)   # 2071
 GRID_SIZE  = 32
-N_SAMPLES      = 100
+N_SAMPLES      = 50
 TRAIN_RATIO    = 0.8   # 80 % train, 20 % test
 N_TRAIN        = int(N_SAMPLES * TRAIN_RATIO)
 TOTAL_ROWS     = 10000
@@ -226,40 +224,103 @@ print(f"Test  : {N_TEST}  grids  →  {len(y_test)} positions")
 print(f"Chance accuracy (majority class): "
       f"{np.bincount(y_train).max() / len(y_train):.3f}")
 
-# ── Train one logistic-regression probe per checkpoint ────────────────────────
+# ── Train all probes in parallel on GPU (batched logistic regression) ─────────
 
-results = []   # list of dicts
+n_classes   = 9      # neighbor sums 0-8
+N_EPOCHS    = 2000
+PROBE_LR    = 0.1
+n_train_pos = N_TRAIN * GRID_SIZE * GRID_SIZE
+n_test_pos  = N_TEST  * GRID_SIZE * GRID_SIZE
 
-print(f"\nTraining {n_checkpoints} probes ...")
+# Reshape: (N_SAMPLES, K, 1024, D) → (K, N_SAMPLES*1024, D)
+X_all_t = (torch.from_numpy(all_acts_np)
+             .float()
+             .permute(1, 0, 2, 3)
+             .reshape(n_checkpoints, -1, d_model))
+y_flat = torch.from_numpy(all_neighbors_np.reshape(-1)).long()
+
+Xk_tr = X_all_t[:, :n_train_pos, :]
+Xk_te = X_all_t[:, n_train_pos:, :]
+y_tr  = y_flat[:n_train_pos]
+y_te  = y_flat[n_train_pos:]
+
+# Per-checkpoint z-score normalisation (equivalent to StandardScaler)
+mean_tr = Xk_tr.mean(dim=1, keepdim=True)               # (K, 1, D)
+std_tr  = Xk_tr.std(dim=1, keepdim=True).clamp(min=1e-8)
+Xk_tr   = (Xk_tr - mean_tr) / std_tr
+Xk_te   = (Xk_te - mean_tr) / std_tr
+
+Xk_tr_d  = Xk_tr.to(device)
+Xk_te_d  = Xk_te.to(device)
+y_tr_d   = y_tr.to(device)
+y_labels = y_tr_d.repeat(n_checkpoints)   # (K * n_train_pos,) — same labels for each probe
+
+# One weight matrix per checkpoint, trained simultaneously via bmm
+W = torch.nn.init.xavier_uniform_(
+    torch.empty(n_checkpoints, d_model, n_classes, device=device)
+).requires_grad_(True)
+b = torch.zeros(n_checkpoints, n_classes, device=device, requires_grad=True)
+
+optimizer = torch.optim.Adam([W, b], lr=PROBE_LR,
+                             weight_decay=1.0 / n_train_pos)
+loss_fn = torch.nn.CrossEntropyLoss()
+
+# Per-probe best-weight tracking: each probe independently snapshots its
+# weights whenever it beats its own previous best test accuracy.
+EVAL_EVERY = 100
+best_W   = W.detach().clone()
+best_b   = b.detach().clone()
+best_acc = torch.zeros(n_checkpoints, device=device)
+y_te_d   = y_te.to(device)
+
+print(f"\nTraining {n_checkpoints} probes in parallel on {device} ...")
+for epoch in range(N_EPOCHS):
+    logits = torch.bmm(Xk_tr_d, W) + b.unsqueeze(1)   # (K, n_train_pos, C)
+    loss   = loss_fn(logits.reshape(-1, n_classes), y_labels)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+
+    if (epoch + 1) % EVAL_EVERY == 0:
+        with torch.no_grad():
+            te_logits = torch.bmm(Xk_te_d, W) + b.unsqueeze(1)        # (K, n_test_pos, C)
+            accs      = (te_logits.argmax(-1) == y_te_d).float().mean(dim=1)  # (K,)
+            improved  = accs > best_acc
+            best_W[improved] = W.detach()[improved]
+            best_b[improved] = b.detach()[improved]
+            best_acc = torch.where(improved, accs, best_acc)
+        if (epoch + 1) % 500 == 0:
+            print(f"  epoch {epoch+1}/{N_EPOCHS}  loss={loss.item():.4f}  "
+                  f"best_acc min={best_acc.min():.3f} max={best_acc.max():.3f}")
+
+print("  done")
+
+with torch.no_grad():
+    tr_preds = (torch.bmm(Xk_tr_d, best_W) + best_b.unsqueeze(1)).argmax(-1).cpu()  # (K, n_train_pos)
+    te_preds = (torch.bmm(Xk_te_d, best_W) + best_b.unsqueeze(1)).argmax(-1).cpu()  # (K, n_test_pos)
+
+y_tr_np = y_tr.numpy()
+y_te_np = y_te.numpy()
+
+results = []
 for k, key in enumerate(checkpoint_keys):
-    Xk_train = X_train[:, k, :, :].reshape(N_TRAIN * GRID_SIZE * GRID_SIZE, d_model)
-    Xk_test  = X_test[:,  k, :, :].reshape(N_TEST  * GRID_SIZE * GRID_SIZE, d_model)
-
-    scaler   = StandardScaler()
-    Xk_train = scaler.fit_transform(Xk_train)
-    Xk_test  = scaler.transform(Xk_test)
-
-    probe = LogisticRegression(
-        max_iter=5000, C=1.0, solver="lbfgs", n_jobs=-1,
-    )
-    probe.fit(Xk_train, y_train)
-
-    train_acc  = accuracy_score(y_train, probe.predict(Xk_train))
-    test_acc   = accuracy_score(y_test,  probe.predict(Xk_test))
-    test_bacc  = balanced_accuracy_score(y_test, probe.predict(Xk_test))
-
+    tr_acc  = accuracy_score(y_tr_np, tr_preds[k].numpy())
+    te_acc  = accuracy_score(y_te_np, te_preds[k].numpy())
+    te_bacc = balanced_accuracy_score(y_te_np, te_preds[k].numpy())
     results.append({
         "checkpoint": k,
         "key":        key,
-        "train_acc":  train_acc,
-        "test_acc":   test_acc,
-        "test_bacc":  test_bacc,
-        "probe":      probe,
-        "scaler":     scaler,
+        "train_acc":  tr_acc,
+        "test_acc":   te_acc,
+        "test_bacc":  te_bacc,
+        "W":    best_W[k].cpu(),   # (D, C) — best weights for this probe
+        "b":    best_b[k].cpu(),   # (C,)
+        "mean": mean_tr[k, 0].cpu(),   # (D,)
+        "std":  std_tr[k, 0].cpu(),    # (D,)
     })
     print(f"  [{k:2d}] {key:35s}  "
-          f"train={train_acc:.3f}  test={test_acc:.3f}  "
-          f"balanced_test={test_bacc:.3f}")
+          f"train={tr_acc:.3f}  test={te_acc:.3f}  "
+          f"balanced_test={te_bacc:.3f}")
 
 # ── Results table ─────────────────────────────────────────────────────────────
 
@@ -335,16 +396,17 @@ print(f"Saved {out_path}")
 
 # ── Plot 2: actual vs predicted neighbor sum — two examples ───────────────────
 
-best_r      = results[best["checkpoint"]]
-best_scaler = best_r["scaler"]
-best_probe  = best_r["probe"]
+def probe_predict(r: dict, X: np.ndarray) -> np.ndarray:
+    """Predict neighbor sum using a stored probe. X: (n, d_model) float32 array."""
+    Xt = (torch.from_numpy(X.astype(np.float32)) - r["mean"]) / r["std"]
+    return (Xt @ r["W"] + r["b"]).argmax(dim=-1).numpy()
+
+best_r = results[best["checkpoint"]]
 
 # Example A: high-entropy grid from the test split
 test_grid   = np.array(list(df.iloc[N_TRAIN]["State 1"]), dtype=np.int32).reshape(GRID_SIZE, GRID_SIZE)
 test_acts   = all_acts_np[N_TRAIN, best["checkpoint"], :, :]
-test_pred   = best_probe.predict(
-                  best_scaler.transform(test_acts)
-              ).reshape(GRID_SIZE, GRID_SIZE)
+test_pred   = probe_predict(best_r, test_acts).reshape(GRID_SIZE, GRID_SIZE)
 test_actual = all_neighbors_np[N_TRAIN].reshape(GRID_SIZE, GRID_SIZE)
 test_err    = (test_pred != test_actual).astype(int)
 
@@ -360,8 +422,8 @@ for r, c in [(0,0),(0,1),(1,0),(1,1)]:              # 2×2 block / still-life (b
 simple_next   = gol_step(simple_grid)
 simple_acts, _= extract_activations(simple_grid, simple_next)
 simple_actual = neighbor_sum(simple_grid).reshape(GRID_SIZE, GRID_SIZE)
-simple_pred   = best_probe.predict(
-                    best_scaler.transform(simple_acts[best["checkpoint"]].numpy())
+simple_pred   = probe_predict(
+                    best_r, simple_acts[best["checkpoint"]].numpy()
                 ).reshape(GRID_SIZE, GRID_SIZE)
 simple_err    = (simple_pred != simple_actual).astype(int)
 
@@ -407,12 +469,12 @@ print(f"Saved {out_path}")
 
 save_path = os.path.join(ACTIVATIONS_DIR, "probe_results.pt")
 torch.save({
-    "results":          results,
-    "checkpoint_keys":  checkpoint_keys,
-    "all_acts":         all_acts_np,
-    "all_neighbors":    all_neighbors_np,
-    "N_TRAIN":          N_TRAIN,
-    "N_TEST":           N_TEST,
-    "grid_size":        GRID_SIZE,
+    "results":         results,          # list of dicts with W/b/mean/std per checkpoint
+    "checkpoint_keys": checkpoint_keys,
+    "all_acts":        all_acts_np,
+    "all_neighbors":   all_neighbors_np,
+    "N_TRAIN":         N_TRAIN,
+    "N_TEST":          N_TEST,
+    "grid_size":       GRID_SIZE,
 }, save_path)
 print(f"Saved probe results to {save_path}")
