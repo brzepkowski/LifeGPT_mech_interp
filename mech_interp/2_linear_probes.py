@@ -35,9 +35,11 @@ print(device)
 NUM_WORDS  = 256
 MAX_LENGTH = len("@PredictNextState<> []$") + (32 * 32 * 2)   # 2071
 GRID_SIZE  = 32
-N_SAMPLES  = 10
-N_TRAIN    = 8    # first 8 examples for training, last 2 for test
-ROW_OFFSET = 5000 # skip low-entropy (near-empty) rows at the start of the CSV
+N_SAMPLES      = 100
+TRAIN_RATIO    = 0.8   # 80 % train, 20 % test
+N_TRAIN        = int(N_SAMPLES * TRAIN_RATIO)
+TOTAL_ROWS     = 10000
+ROW_SKIP_START = 0    # skip the near-empty all-zero rows at the very start
 
 SCRIPT_DIR      = os.path.dirname(os.path.abspath(__file__))
 PLOTS_DIR       = os.path.join(SCRIPT_DIR, "plots")
@@ -85,6 +87,12 @@ def neighbor_sum(grid: np.ndarray) -> np.ndarray:
         for dc in [-1, 0, 1]
         if not (dr == 0 and dc == 0)
     ).astype(np.int32)
+
+
+def gol_step(grid: np.ndarray) -> np.ndarray:
+    """One GoL step with toroidal boundary conditions."""
+    n = neighbor_sum(grid)
+    return ((n == 3) | (grid.astype(bool) & (n == 2))).astype(np.int32)
 
 # ── Load model ────────────────────────────────────────────────────────────────
 
@@ -167,7 +175,9 @@ def extract_activations(current_state: np.ndarray, next_state: np.ndarray):
 # ── Load dataset ──────────────────────────────────────────────────────────────
 
 print(f"\nLoading {N_SAMPLES} examples from {os.path.basename(DATA_CSV)} ...")
-df = pd.read_csv(DATA_CSV, skiprows=range(1, ROW_OFFSET + 1), nrows=N_SAMPLES, dtype=str)
+_sample_idx  = np.linspace(ROW_SKIP_START, TOTAL_ROWS - 1, N_SAMPLES, dtype=int)
+_rows_to_skip = sorted(set(range(1, TOTAL_ROWS + 1)) - set(_sample_idx + 1))
+df = pd.read_csv(DATA_CSV, skiprows=_rows_to_skip, dtype=str)
 
 # ── Extract activations and neighbor sums for all examples ────────────────────
 
@@ -230,8 +240,7 @@ for k, key in enumerate(checkpoint_keys):
     Xk_test  = scaler.transform(Xk_test)
 
     probe = LogisticRegression(
-        max_iter=1000, C=1.0, solver="lbfgs",
-        multi_class="multinomial", n_jobs=-1,
+        max_iter=5000, C=1.0, solver="lbfgs", n_jobs=-1,
     )
     probe.fit(Xk_train, y_train)
 
@@ -245,6 +254,8 @@ for k, key in enumerate(checkpoint_keys):
         "train_acc":  train_acc,
         "test_acc":   test_acc,
         "test_bacc":  test_bacc,
+        "probe":      probe,
+        "scaler":     scaler,
     })
     print(f"  [{k:2d}] {key:35s}  "
           f"train={train_acc:.3f}  test={test_acc:.3f}  "
@@ -294,6 +305,103 @@ out_path = os.path.join(PLOTS_DIR, "probe_accuracy_by_layer.png")
 plt.savefig(out_path, dpi=150, bbox_inches="tight")
 plt.close()
 print(f"\nSaved {out_path}")
+
+# ── Plot 1: test accuracy by depth (clean, dedicated) ────────────────────────
+
+fig, ax = plt.subplots(figsize=(12, 4))
+ax.plot(indices, test_accs, marker="s", linewidth=2, markersize=5, color="darkorange",
+        label="Test accuracy")
+ax.axhline(chance, color="red", linestyle=":", linewidth=1.2,
+           label=f"Chance ({chance:.3f})")
+ax.annotate(
+    f"best: ckpt {best['checkpoint']}\n{best['key']}",
+    xy=(best["checkpoint"], best["test_acc"]),
+    xytext=(best["checkpoint"] - 4, best["test_acc"] - 0.12),
+    arrowprops=dict(arrowstyle="->", color="black"),
+    fontsize=8,
+)
+ax.set_xlabel("Layer checkpoint index")
+ax.set_ylabel("Test accuracy")
+ax.set_title("Linear probe test accuracy: predicting neighbor sum by layer")
+ax.set_xticks(indices)
+ax.set_xticklabels(checkpoint_keys, rotation=90, fontsize=7)
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+out_path = os.path.join(PLOTS_DIR, "probe_test_accuracy_by_layer.png")
+plt.savefig(out_path, dpi=150, bbox_inches="tight")
+plt.close()
+print(f"Saved {out_path}")
+
+# ── Plot 2: actual vs predicted neighbor sum — two examples ───────────────────
+
+best_r      = results[best["checkpoint"]]
+best_scaler = best_r["scaler"]
+best_probe  = best_r["probe"]
+
+# Example A: high-entropy grid from the test split
+test_grid   = np.array(list(df.iloc[N_TRAIN]["State 1"]), dtype=np.int32).reshape(GRID_SIZE, GRID_SIZE)
+test_acts   = all_acts_np[N_TRAIN, best["checkpoint"], :, :]
+test_pred   = best_probe.predict(
+                  best_scaler.transform(test_acts)
+              ).reshape(GRID_SIZE, GRID_SIZE)
+test_actual = all_neighbors_np[N_TRAIN].reshape(GRID_SIZE, GRID_SIZE)
+test_err    = (test_pred != test_actual).astype(int)
+
+# Example B: sparse, human-readable pattern (glider + blinker + 2×2 block)
+simple_grid = np.zeros((GRID_SIZE, GRID_SIZE), dtype=np.int32)
+for r, c in [(0,1),(1,2),(2,0),(2,1),(2,2)]:       # glider (top-left)
+    simple_grid[r + 2, c + 2] = 1
+for r, c in [(0,0),(0,1),(0,2)]:                    # blinker, horizontal (centre)
+    simple_grid[r + 15, c + 14] = 1
+for r, c in [(0,0),(0,1),(1,0),(1,1)]:              # 2×2 block / still-life (bottom-right)
+    simple_grid[r + 25, c + 25] = 1
+
+simple_next   = gol_step(simple_grid)
+simple_acts, _= extract_activations(simple_grid, simple_next)
+simple_actual = neighbor_sum(simple_grid).reshape(GRID_SIZE, GRID_SIZE)
+simple_pred   = best_probe.predict(
+                    best_scaler.transform(simple_acts[best["checkpoint"]].numpy())
+                ).reshape(GRID_SIZE, GRID_SIZE)
+simple_err    = (simple_pred != simple_actual).astype(int)
+
+# Draw both rows
+examples = [
+    ("High-entropy grid", test_grid,    test_actual,   test_pred,   test_err),
+    ("Sparse pattern (glider + blinker + block)", simple_grid, simple_actual, simple_pred, simple_err),
+]
+
+fig, axes = plt.subplots(2, 4, figsize=(18, 10))
+cmap, vmin, vmax = "YlOrRd", 0, 8
+
+for row, (label, grid, actual, pred, err) in enumerate(examples):
+    im0 = axes[row, 0].imshow(grid, cmap="binary", vmin=0, vmax=1, interpolation="nearest")
+    axes[row, 0].set_title(f"{label}\n({grid.sum()} live cells)", fontsize=11)
+    axes[row, 0].axis("off")
+    plt.colorbar(im0, ax=axes[row, 0], ticks=[0, 1])
+
+    im1 = axes[row, 1].imshow(actual, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+    axes[row, 1].set_title("Actual neighbor sum", fontsize=11)
+    axes[row, 1].axis("off")
+    plt.colorbar(im1, ax=axes[row, 1], ticks=range(9))
+
+    im2 = axes[row, 2].imshow(pred, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
+    axes[row, 2].set_title(
+        f"Predicted (ckpt {best['checkpoint']})\nacc = {best['test_acc']:.3f}", fontsize=11)
+    axes[row, 2].axis("off")
+    plt.colorbar(im2, ax=axes[row, 2], ticks=range(9))
+
+    im3 = axes[row, 3].imshow(err, cmap="Reds", vmin=0, vmax=1, interpolation="nearest")
+    axes[row, 3].set_title(
+        f"Errors  ({err.sum()} / {GRID_SIZE * GRID_SIZE} cells wrong)", fontsize=11)
+    axes[row, 3].axis("off")
+    plt.colorbar(im3, ax=axes[row, 3])
+
+plt.tight_layout()
+out_path = os.path.join(PLOTS_DIR, "best_probe_prediction_vs_actual.png")
+plt.savefig(out_path, dpi=150, bbox_inches="tight")
+plt.close()
+print(f"Saved {out_path}")
 
 # ── Save probe results ────────────────────────────────────────────────────────
 
