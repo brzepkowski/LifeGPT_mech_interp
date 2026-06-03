@@ -134,9 +134,10 @@ def find_first_error(
     ground_truth_states[i] is the ground-truth string for step i+1
     (i.e. index 0 = State 2, index 1 = State 3, ...).
     """
-    current_input = extract_task(
+    current_input      = extract_task(
         f"@PredictNextState<{initial_state_str}>", end_task_token=">"
     )
+    last_correct_state = initial_state_str  # updated each time a step matches
 
     for step in range(MAX_ARAR_STEPS):
         # Pass the prompt string directly (not as a list); texts_to_sequences
@@ -177,10 +178,12 @@ def find_first_error(
                 "wrong_positions": wrong_positions,
                 "generated": generated_cmp,
                 "ground_truth": gt_cmp,
+                "last_correct_state": last_correct_state,
                 "arar_step_index": step,
             }
 
-        # Feed the generated state back as next input
+        # This step was correct; save it and feed the generated state back
+        last_correct_state = generated_cmp
         current_input = f"@PredictNextState<{generated}>"
         print(f"  step {step + 2:>3d}: perfect match")
 
@@ -197,37 +200,54 @@ def plot_first_error(case_name: str, result: dict, initial_state_str: str):
     step      = result["first_error_step"]
     gen_str   = result["generated"]
     gt_str    = result["ground_truth"]
+    lc_str    = result["last_correct_state"]
 
-    gen_grid  = np.array([int(c) for c in gen_str], dtype=np.int32).reshape(GRID_SIZE, GRID_SIZE)
-    gt_grid   = np.array([int(c) for c in gt_str],  dtype=np.int32).reshape(GRID_SIZE, GRID_SIZE)
-    init_grid = np.array([int(c) for c in initial_state_str], dtype=np.int32).reshape(GRID_SIZE, GRID_SIZE)
+    def to_grid(s):
+        return np.array([int(c) for c in s], dtype=np.int32).reshape(GRID_SIZE, GRID_SIZE)
+
+    init_grid = to_grid(initial_state_str)
+    lc_grid   = to_grid(lc_str)
+    gt_grid   = to_grid(gt_str)
+    gen_grid  = to_grid(gen_str)
 
     diff = gen_grid.astype(int) - gt_grid.astype(int)
-    diff_rgb          = np.ones((*diff.shape, 3))
+    diff_rgb             = np.ones((*diff.shape, 3))
     diff_rgb[diff ==  1] = [1.0, 0.2, 0.2]  # false positive → red
     diff_rgb[diff == -1] = [0.2, 0.4, 1.0]  # false negative → blue
 
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+    last_correct_step = step - 1  # State number of the last matching state
 
-    axes[0].imshow(init_grid, cmap="binary", vmin=0, vmax=1)
-    axes[0].set_title("IC (State 1)", fontsize=11)
-    axes[0].axis("off")
+    ticks = list(range(0, GRID_SIZE, 4))
 
-    axes[1].imshow(gt_grid, cmap="binary", vmin=0, vmax=1)
-    axes[1].set_title(f"Ground truth\n(State {step})", fontsize=11)
-    axes[1].axis("off")
+    def style_ax(ax, img, title, cmap="binary"):
+        kw = {"interpolation": "nearest",
+              "extent": [-0.5, GRID_SIZE - 0.5, GRID_SIZE - 0.5, -0.5]}
+        if cmap is not None:
+            kw.update({"cmap": cmap, "vmin": 0, "vmax": 1})
+        ax.imshow(img, **kw)
+        ax.set_title(title, fontsize=11)
+        ax.set_xticks(ticks)
+        ax.set_yticks(ticks)
+        ax.tick_params(labelsize=7, length=3, width=0.8)
+        ax.set_xlim(-0.5, GRID_SIZE - 0.5)
+        ax.set_ylim(GRID_SIZE - 0.5, -0.5)
+        # grid aligned to cell boundaries
+        ax.set_xticks([x - 0.5 for x in range(1, GRID_SIZE)], minor=True)
+        ax.set_yticks([y - 0.5 for y in range(1, GRID_SIZE)], minor=True)
+        ax.grid(which="minor", color="gray", linewidth=0.3, alpha=0.5)
+        ax.tick_params(which="minor", length=0)
+        for spine in ax.spines.values():
+            spine.set_edgecolor("black")
+            spine.set_linewidth(1.5)
 
-    axes[2].imshow(gen_grid, cmap="binary", vmin=0, vmax=1)
-    axes[2].set_title(f"Model prediction\n(State {step})", fontsize=11)
-    axes[2].axis("off")
+    fig, axes = plt.subplots(1, 5, figsize=(22, 5))
 
-    axes[3].imshow(diff_rgb)
-    axes[3].set_title(
-        f"First error map\n{result['n_wrong_cells']} wrong cells "
-        f"({result['error_rate']:.3f})",
-        fontsize=11,
-    )
-    axes[3].axis("off")
+    style_ax(axes[0], init_grid, "IC\n(State 1)")
+    style_ax(axes[1], lc_grid,   f"Last correct\n(State {last_correct_step})")
+    style_ax(axes[2], gt_grid,   f"Ground truth\n(State {step})")
+    style_ax(axes[3], gen_grid,  f"Model prediction\n(State {step})")
+    style_ax(axes[4], diff_rgb,  f"Error map\n{result['n_wrong_cells']} wrong cells "
+                                 f"({result['error_rate']:.3f})", cmap=None)
 
     safe_name = case_name.replace(":", "").replace(" ", "_").replace(".", "p")
     fig.suptitle(f"{case_name}  —  first error at State {step}", fontsize=13)
