@@ -46,7 +46,7 @@ LAYERS           = list(range(12))   # which transformer layers to analyse
 # "dataset"   — average over N_EXAMPLES rows from the CSV
 # "all_alive" — every cell is 1 (maximally symmetric, content-free baseline)
 EXAMPLE_MODE = "dataset"
-N_EXAMPLES   = 10   # number of dataset examples to average over (dataset mode only)
+N_EXAMPLES   = 500   # number of dataset examples to average over (dataset mode only)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PLOTS_DIR  = os.path.join(SCRIPT_DIR, "plots", "attn")
