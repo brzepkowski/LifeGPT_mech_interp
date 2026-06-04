@@ -89,6 +89,42 @@ conway_states_{s_order}_{e_order}_{A}by{N}by{N}by{I}_toroidal_{timestamp}.csv
 ```
 where `A` = number of samples, `N` = grid size, `I` = number of timesteps, `s/e_order` = entropy range (0→1 = broad, 0.5→0.5 = high-entropy).
 
+## Mechanistic interpretability scripts (`mech_interp/`)
+
+All scripts share the same model checkpoint and dataset paths (hardcoded at the top of each file). Plots are saved under `mech_interp/plots/`; attention-specific plots go into `mech_interp/plots/attn/`.
+
+| Script | Purpose |
+|---|---|
+| `0_inference_demo.py` | Single inference pass demo |
+| `1_hidden_states_demo.py` | Extract and visualise hidden states |
+| `2_linear_probes.py` | Train linear probes on hidden states |
+| `3_first_error_detection.py` | ARAR loop on known error-producing initial conditions |
+| `4_attention_patterns.py` | Full-resolution attention matrix plots (layer 0, one file per head, 1 px/token) |
+| `5_attn_neighborhood_score.py` | Moore-neighbourhood attention score averaged over many examples |
+
+### `4_attention_patterns.py`
+
+Selects one example from the dataset (closest to `TARGET_DENSITY=0.35` with `≥ MIN_BORDER_ALIVE=3` live border cells), runs a teacher-forced forward pass with `attn_flash=False` to capture attention weights, then saves a full-resolution `seq_len×seq_len` attention heatmap for each head in layer 0. Outputs `plots/attn/attn_layer00_head{h:02d}_full.png`.
+
+### `5_attn_neighborhood_score.py`
+
+For every output cell `(r, c)` and each attention head, computes:
+
+```
+score[layer, head, r, c] = Σ attn to the 8 Moore neighbours / Σ attn to entire input block
+```
+
+Averaged over `N_EXAMPLES` dataset examples sampled evenly across the density range (to avoid clustering at one entropy level). Two example modes: `"dataset"` or `"all_alive"` (hardcoded all-1 board, content-free baseline).
+
+**Key design note — two separate masks:**
+- `neighbor_mask` (shape `1024×1024`): marks which input cells are the 8 toroidal Moore neighbours of each output cell. Applied to attention weights during the forward-pass loop to *compute* the score.
+- Region masks `mask_tl`, `mask_top`, … (shape `32×32`): partition the grid into 9 spatial regions (4 corners, 4 edges, bulk) arranged to mirror the physical board layout. Applied to the *already-computed* `score_map` to average scores for the summary plot. They never touch attention weights.
+
+**Outputs** (all in `plots/attn/`):
+- `attn_nbr_layer{L:02d}_{tag}_heads.png` — 2×4 grid of 32×32 score heatmaps per head, per layer
+- `attn_nbr_summary_{tag}.png` — 3×3 spatial layout; each panel is a layer×head heatmap of mean score for one region
+- `attn_nbr_scores_{tag}.npz` — raw `score_map` array, shape `(n_layers, n_heads, 32, 32)`, for use in downstream analysis scripts
+
 ## Inference pattern
 
 ```python
