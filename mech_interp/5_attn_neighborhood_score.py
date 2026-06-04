@@ -192,7 +192,13 @@ for ex_idx, (current_state, next_state) in enumerate(examples):
         n_heads     = attn_layers[0].shape[0]
         score_accum = np.zeros((n_layers, n_heads, G, G), dtype=np.float64)
 
-        # build toroidal Moore-neighbour mask once (same for all examples/layers)
+        # ── neighbor_mask : shape (n_cells, n_cells) ──────────────────────────
+        # neighbor_mask[i, j] = True  iff INPUT cell j is one of the 8 toroidal
+        # Moore neighbours of OUTPUT cell i.
+        # This mask is applied to the raw attention weights to SELECT which
+        # attended positions count as "correct" when computing the score.
+        # It has nothing to do with grouping cells by grid region — that is
+        # handled separately by the region masks (mask_blk, mask_top, …) below.
         rr, cc = np.meshgrid(np.arange(G), np.arange(G), indexing="ij")
         i_flat        = (rr * G + cc).flatten()
         neighbor_mask = np.zeros((n_cells, n_cells), dtype=bool)
@@ -218,14 +224,43 @@ score_map = score_accum / len(examples)   # (n_layers, n_heads, G, G) — averag
 
 print(f"{n_layers} layers × {n_heads} heads, scores averaged over {len(examples)} examples")
 
-# ── Cell-type masks ───────────────────────────────────────────────────────────
+# ── Region masks : shape (G, G) ───────────────────────────────────────────────
+# These masks are completely independent of neighbor_mask above.
+# neighbor_mask operates on the (n_cells × n_cells) attention matrix and
+# determines WHICH ATTENDED POSITIONS are correct neighbours.
+# Region masks operate on the already-computed (G × G) score_map and
+# determine WHICH OUTPUT CELLS to average over when producing each panel
+# of the summary plot.  They never touch the attention weights.
+#
+# 9 regions arranged to mirror the spatial layout of the grid:
+#
+#   TL corner  |  Top edge   |  TR corner
+#   Left edge  |  Bulk       |  Right edge
+#   BL corner  |  Bottom edge|  BR corner
 
-corner_mask = np.zeros((G, G), dtype=bool)
-corner_mask[[0, 0, -1, -1], [0, -1, 0, -1]] = True
-edge_mask   = np.zeros((G, G), dtype=bool)
-edge_mask[0, :] = edge_mask[-1, :] = edge_mask[:, 0] = edge_mask[:, -1] = True
-edge_mask   = edge_mask & ~corner_mask
-bulk_mask   = ~(corner_mask | edge_mask)
+def _make_mask(rows, cols):
+    m = np.zeros((G, G), dtype=bool)
+    m[np.ix_(rows, cols)] = True
+    return m
+
+inner = list(range(1, G - 1))
+
+mask_tl  = _make_mask([0],       [0])
+mask_top = _make_mask([0],       inner)
+mask_tr  = _make_mask([0],       [G-1])
+mask_lft = _make_mask(inner,     [0])
+mask_blk = _make_mask(inner,     inner)
+mask_rgt = _make_mask(inner,     [G-1])
+mask_bl  = _make_mask([G-1],     [0])
+mask_bot = _make_mask([G-1],     inner)
+mask_br  = _make_mask([G-1],     [G-1])
+
+# 3×3 spatial grid of (mask, label) — layout mirrors the physical board
+regions = [
+    [(mask_tl,  "TL corner"), (mask_top, "Top edge"),    (mask_tr,  "TR corner")],
+    [(mask_lft, "Left edge"), (mask_blk, "Bulk"),         (mask_rgt, "Right edge")],
+    [(mask_bl,  "BL corner"), (mask_bot, "Bottom edge"),  (mask_br,  "BR corner")],
+]
 
 # ── Plot: per-layer per-head heatmaps ─────────────────────────────────────────
 
@@ -253,41 +288,42 @@ for li, layer_idx in enumerate(LAYERS):
     plt.close()
     print(f"  Layer {layer_idx:2d}: saved {os.path.basename(out_path)}")
 
-# ── Plot: layer × head summary heatmap (mean score per cell type) ─────────────
+# ── Plot: 3×3 summary heatmap (layer × head, one panel per region) ────────────
 #
-# Three side-by-side heatmaps: bulk / edge / corner mean score,
-# axes are layer (rows) × head (columns).
+# Panels are arranged spatially to mirror the board layout:
+#   TL corner  |  Top edge   |  TR corner
+#   Left edge  |  Bulk       |  Right edge
+#   BL corner  |  Bottom edge|  BR corner
 
-fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+fig, axes = plt.subplots(3, 3, figsize=(24, n_layers * 0.9 + 3))
 fig.suptitle(
     f"Neighbourhood attention score by layer × head  [{example_tag}]\n"
     f"averaged over {len(examples)} examples  |  1.0 = perfect neighbourhood routing",
-    fontsize=10,
+    fontsize=11,
 )
 
-for ax, mask, label in zip(axes,
-                            [bulk_mask, edge_mask, corner_mask],
-                            ["Bulk", "Edge", "Corner"]):
-    # mean_scores[li, h] = mean score over cells of this type
-    data = np.array([[score_map[li, h][mask].mean()
-                      for h in range(n_heads)]
-                     for li in range(n_layers)])   # (n_layers, n_heads)
+for row_idx, row_regions in enumerate(regions):
+    for col_idx, (mask, label) in enumerate(row_regions):
+        ax = axes[row_idx, col_idx]
+        data = np.array([[score_map[li, h][mask].mean()
+                          for h in range(n_heads)]
+                         for li in range(n_layers)])   # (n_layers, n_heads)
 
-    im = ax.imshow(data, cmap="RdYlGn", vmin=0, vmax=1, aspect="auto",
-                   interpolation="nearest")
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    ax.set_title(label, fontsize=10)
-    ax.set_xlabel("Head")
-    ax.set_ylabel("Layer")
-    ax.set_xticks(range(n_heads))
-    ax.set_xticklabels([f"H{h}" for h in range(n_heads)], fontsize=7)
-    ax.set_yticks(range(n_layers))
-    ax.set_yticklabels([f"L{LAYERS[li]}" for li in range(n_layers)], fontsize=7)
+        im = ax.imshow(data, cmap="RdYlGn", vmin=0, vmax=1, aspect="auto",
+                       interpolation="nearest")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        ax.set_title(label, fontsize=9)
+        ax.set_xlabel("Head", fontsize=7)
+        ax.set_ylabel("Layer", fontsize=7)
+        ax.set_xticks(range(n_heads))
+        ax.set_xticklabels([f"H{h}" for h in range(n_heads)], fontsize=6)
+        ax.set_yticks(range(n_layers))
+        ax.set_yticklabels([f"L{LAYERS[li]}" for li in range(n_layers)], fontsize=6)
 
-    for li in range(n_layers):
-        for h in range(n_heads):
-            ax.text(h, li, f"{data[li, h]:.2f}", ha="center", va="center",
-                    fontsize=5, color="black" if data[li, h] > 0.5 else "white")
+        for li in range(n_layers):
+            for h in range(n_heads):
+                ax.text(h, li, f"{data[li, h]:.2f}", ha="center", va="center",
+                        fontsize=4, color="black" if data[li, h] > 0.5 else "white")
 
 plt.tight_layout()
 out_path = os.path.join(PLOTS_DIR, f"attn_nbr_summary_{example_tag}.png")
@@ -296,25 +332,20 @@ plt.close()
 print(f"\nSaved {os.path.basename(out_path)}")
 
 # ── Summary table ─────────────────────────────────────────────────────────────
+# One table per layer: rows = heads, columns = 9 regions.
 
-print(f"\n── Neighbourhood attention score by layer / head / cell type ────────────")
-header = f"{'':6}  " + "  ".join(
-    f"{'L'+str(LAYERS[li]):>18}" for li in range(n_layers)
-)
-subhdr = f"{'':6}  " + "  ".join(
-    f"{'Bulk':>5} {'Edge':>5} {'Cor':>5}" for _ in range(n_layers)
-)
-print(f"       " + "  ".join(f"{'Layer '+str(LAYERS[li]):^17}" for li in range(n_layers)))
-print(f"{'Head':>6}  " + "  ".join(f"{'Bulk':>5} {'Edge':>5} {'Cor':>5}" for _ in range(n_layers)))
-print("─" * (8 + n_layers * 20))
-for h in range(n_heads):
-    row = f"  H{h}    "
-    for li in range(n_layers):
-        b = score_map[li, h][bulk_mask].mean()
-        e = score_map[li, h][edge_mask].mean()
-        c = score_map[li, h][corner_mask].mean()
-        row += f"{b:5.2f} {e:5.2f} {c:5.2f}  "
-    print(row)
+flat_regions = [(mask, label) for row in regions for mask, label in row]
+region_labels = [label for _, label in flat_regions]
+region_masks  = [mask  for mask, _ in flat_regions]
+
+print(f"\n── Neighbourhood attention score by layer / head / region ───────────────")
+for li, layer_idx in enumerate(LAYERS):
+    print(f"\n  Layer {layer_idx}")
+    print(f"  {'Head':>4}  " + "  ".join(f"{lbl:>10}" for lbl in region_labels))
+    print(f"  {'':>4}  " + "─" * (12 * len(region_labels)))
+    for h in range(n_heads):
+        vals = [score_map[li, h][m].mean() for m in region_masks]
+        print(f"  H{h:1d}    " + "  ".join(f"{v:10.3f}" for v in vals))
 
 # ── Save raw scores ───────────────────────────────────────────────────────────
 #
